@@ -1,0 +1,884 @@
+---
+title: "Model and Simulation for Longitudinal Data"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(cquad))
+```
+
+## Code for Conditional EM Model
+
+```{r}
+# initialize parameters
+initialize_para_var <- function(n1, p, k) {
+  alpha <- rep(0, n1 - 1)
+  beta <- matrix(rnorm(2), nrow = 1, ncol = 2)
+  eta <- matrix(rep(c(0, runif(1)), each = n1 - 1), nrow = n1 - 1, ncol = k)
+  
+  para <- list(alpha, beta, eta)
+  return(para)
+}
+
+# E-step
+e_step_var <- function(data, ids, para, k, n1, n2) {
+  
+  # assign the parameters
+  alpha <- matrix(rep(para[[1]], times = k), ncol = k)
+  beta <- para[[2]]
+  beta <- rbind(alpha, beta)
+  eta <- para[[3]]
+  
+  B <- sq(n1)
+  sumB <- rowSums(B)
+  
+  posterior_probs <- matrix(NA, nrow = n2, ncol = k)
+  
+  for (i in 1:n2) {
+    # subject id
+    id <- ids[i]
+    # subject data
+    data_i <- data[data$id == id, ]
+    x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+    y_i <- as.array(data_i[, "y"])
+    v_i <- as.array(data_i[1, "v"])
+
+    T_i <- nrow(data_i)
+    sumY <- sum(y_i)
+    if (T_i == n1) {
+      B_i <- B[sumB == sumY, ]
+    } else {
+      B_i <- sq(T_i, sumY)
+    }
+    
+    for (j in 1:k) {
+      x_beta <- x_i %*% beta[, j]
+      denominator <- exp(B_i %*% x_beta)
+      sum_denominator <- sum(denominator)
+      posterior_probs[i, j] <- exp(t(y_i) %*% x_beta) * exp(eta[sumY, j] %*% v_i) / sum_denominator
+    }
+  }
+  posterior_probs <- posterior_probs / rowSums(posterior_probs)
+  return(posterior_probs)
+}
+
+# M-step
+m_step_var <- function(data, para, posterior_probs, ids, k, n1, n2) {
+  # get current parameters
+  alpha <- para[[1]]
+  beta <- para[[2]]
+  eta <- para[[3]]
+  
+  # update beta
+  for (j in 1:k) {
+    for (iter in 1:1){
+      beta_alpha <- c(alpha, beta[, j])
+      result_grad <- array(NA, dim = n2)
+      result_hess <- array(NA, dim = n2)
+      
+      B <- sq(n1)
+      sumB <- rowSums(B)
+      for (i in 1:n2) {
+        id <- ids[i]
+        data_i <- data[data$id == id, ]
+        x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+        x_i_pure <- as.array(data_i[, "x"])
+        y_i <- as.array(data_i[, "y"])
+        T_i <- nrow(data_i)
+        sumY <- sum(y_i)
+        if (T_i == n1) {
+          B_i <- B[sumB == sumY, ]
+        } else {
+          B_i <- sq(T_i, sumY)
+        }
+        
+        x_beta <- x_i %*% beta_alpha
+        denominator <- exp(B_i %*% x_beta)
+        sum_denominator <- sum(denominator)
+        
+        pp_i <- as.vector(denominator / sum_denominator)
+        e_i <- as.vector(t(B_i) %*% pp_i)
+        V_i <- t(B_i) %*% diag(pp_i) %*% B_i- e_i %*% t(e_i)
+        
+        result_grad[i] <- posterior_probs[i, j] * t(x_i_pure) %*% (y_i - e_i)
+        result_hess[i] <- - posterior_probs[i, j] * (t(x_i_pure) %*% V_i %*% x_i_pure)
+      }
+      grad <- sum(result_grad)
+      hess <- sum(result_hess)
+      
+      beta[, j] <- beta[, j] - grad / hess
+    }
+  }
+  
+  # update eta
+  result_grad <- matrix(0, nrow = n1 - 1, ncol = n2)
+  result_hess <- matrix(0, nrow = n1 - 1, ncol = n2)
+  for (i in 1:n2) {
+    id <- ids[i]
+    data_i <- data[data$id == id, ]
+    v_i <- as.array(data_i[1, "v"])
+    sumY <- sum(data_i[, "y"])
+    result_grad[sumY, i] <- v_i * (posterior_probs[i, 2] - exp(v_i * eta[sumY, 2]) / (1 + exp(v_i * eta[sumY, 2])))
+    result_hess[sumY, i] <- - v_i %*% t(v_i) * exp(v_i %*% eta[sumY, 2]) / (1 + exp(v_i %*% eta[sumY, 2]))^2
+  }
+  
+  for (i in 1:(n1 - 1)) {
+    # print(sum(result_grad[i, ]))
+    # print(sum(result_hess[i, ]))
+    eta[i, 2] <- eta[i, 2] - sum(result_grad[i, ]) / sum(result_hess[i, ])
+  }
+  # print(eta)
+  
+  para <- list(alpha, beta, eta)
+  return(para)
+}
+
+m_step_var_last <- function(data, para, posterior_probs, ids, k, n1, n2) {
+  # get current parameters
+  alpha <- para[[1]]
+  beta <- para[[2]]
+  eta <- para[[3]]
+  
+  # standard error
+  # just to get a matrix with the same size
+  beta_sd <- beta * 0
+  
+  # update beta
+  for (j in 1:k) {
+    beta_alpha <- c(alpha, beta[, j])
+    result_grad <- array(NA, dim = n2)
+    result_hess <- array(NA, dim = n2)
+    result_1 <- array(NA, dim = n2)
+    
+    B <- sq(n1)
+    sumB <- rowSums(B)
+    for (i in 1:n2) {
+      id <- ids[i]
+      data_i <- data[data$id == id, ]
+      x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+      x_i_pure <- as.array(data_i[, "x"])
+      y_i <- as.array(data_i[, "y"])
+      T_i <- nrow(data_i)
+      sumY <- sum(y_i)
+      if (T_i == n1) {
+        B_i <- B[sumB == sumY, ]
+      } else {
+        B_i <- sq(T_i, sumY)
+      }
+      
+      x_beta <- x_i %*% beta_alpha
+      denominator <- exp(B_i %*% x_beta)
+      sum_denominator <- sum(denominator)
+      
+      pp_i <- as.vector(denominator / sum_denominator)
+      e_i <- as.vector(t(B_i) %*% pp_i)
+      V_i <- t(B_i) %*% diag(pp_i) %*% B_i- e_i %*% t(e_i)
+      
+      result_grad[i] <- posterior_probs[i, j] * t(x_i_pure) %*% (y_i - e_i)
+      result_hess[i] <- - posterior_probs[i, j] * (t(x_i_pure) %*% V_i %*% x_i_pure)
+      result_1[i] <- posterior_probs[i, j] * t(t(x_i_pure) %*% (y_i - e_i)) %*% 
+        (t(x_i_pure) %*% (y_i - e_i))
+    }
+    grad <- sum(result_grad)
+    hess <- sum(result_hess)
+    
+    beta[, j] <- beta[, j] - grad / hess
+    
+    matrix_1 <- result_grad %*% t(result_grad)
+    diag_mask <- diag(nrow(matrix_1))
+    off_diag_sum <- sum(matrix_1[!diag_mask])
+    
+    # fisher <- - hess - sum(result_1) - off_diag_sum + grad^2
+    fisher <- - hess - sum(result_1) - off_diag_sum
+    beta_sd[, j] <- sqrt(1 / fisher)
+  }
+  
+  para <- list(alpha, beta, eta, beta_sd)
+  return(para)
+}
+
+# EM Alg
+suppressPackageStartupMessages(library(dplyr))
+em_alg_var <- function(data, p, k, max_iter, tol) {
+  # sum of the response of each subject
+  sumYs <- data %>% 
+    group_by(id) %>% 
+    summarise(total = sum(y), 
+              count = n()) %>% 
+    ungroup()
+  sumYs <- as.data.frame(sumYs)
+  n1 <- max(sumYs$count)
+  n2 <- nrow(sumYs)
+  ids <- sumYs$id
+  
+  para <- initialize_para_var(n1, p, k)
+  
+  for (i in 1:max_iter) {
+    posterior_probs <- e_step_var(data, ids, para, k, n1, n2)
+    new_para <- m_step_var(data, para, posterior_probs, ids, k, n1, n2)
+    
+    if (i > 4) {
+      if (sqrt(sum((new_para[[2]] - para[[2]])^2)) < tol) {
+        cat("Converged in", i, "iterations.\n")
+        break
+      }
+    }
+    para <- new_para
+  }
+  
+  # check error rate find min error rate and permute according to it
+  posterior_probs <- e_step_var(data, ids, para, k, n1, n2)
+  para <- m_step_var_last(data, para, posterior_probs, ids, k, n1, n2)
+  
+  max_col_indices <- apply(posterior_probs, 1, which.max)
+  
+  class <- data %>% group_by(id) %>% summarise(latent_class = latent_class[1]) %>% ungroup()
+  
+  para <- permutation_error(para, k, class, max_col_indices)
+  
+  names(para) <- c("alpha", "beta", "eta_sumY", "beta_se")
+  return(para)
+}
+
+permutation_error <- function(para, k, classes, predict_classes) {
+  beta <- para[[2]]
+  if (beta[1] < 0 && beta[2] >= 0) {
+    order <- c(1, 2)
+  } else if (beta[2] < 0 && beta[1] >= 0) {
+    order <- c(2, 1)
+  } else if (beta[1] < 0 && beta[2] < 0) {
+    if (beta[1] < beta[2]) {
+      order <- c(1, 2)
+    } else {
+      order <- c(2, 1)
+    }
+  } else {
+    if (beta[1] < beta[2])
+      order <- c(1, 2)
+    else
+      order <- c(2, 1)
+  }
+  
+  para[[2]] <- para[[2]][, order]
+  para[[3]] <- para[[3]][, order]
+  para[[4]] <- para[[4]][, order]
+  
+  return(para)
+}
+```
+
+One trail
+
+```{r}
+# one try
+alpha <- c(0, 0, 0, 0, 0, 0)
+beta <- c(-1, 1)
+eta <- c(0, 1)
+n1 <- 6
+n2 <- 400
+# probability of missing
+prob <- 0.2
+
+data <- generate_data(n1, n2, alpha, beta, k = 2, eta)
+data <- current_lag_miss(data, n1, n2, prob = 0.2)
+data <- delete_sumY(data)
+# data <- delete_all_0_1(data)
+# data <- lag_1_miss(data, n1, n2, prob)
+# data <- delete_complete(data)
+
+mod <- em_alg_var(data, p = 1, k = 2, max_iter = 1, tol = 1e-6)
+mod
+```
+
+Repeated experiments
+
+```{r}
+# repeated experiments
+library(parallel)
+rep_times <- 20
+alpha <- c(0, 0, 0, 0)
+beta <- c(-1, 1)
+eta <- c(0, 1)
+
+rep_exp <- function(rep_times, n1, n2, alpha, beta, eta) {
+  results <- mclapply(1:rep_times, 
+                      function(i) {
+                        data <- generate_data(n1, n2, alpha, beta, k = 2, eta)
+                        # data <- covariate_miss(data, n1, n2, prob = 0.2)
+                        # data <- delete_all_0_1(data)
+                        
+                        # data <- current_response_miss(data, n1, n2, prob = 0.2)
+                        # data <- delete_all_0_1(data)
+                        
+                        data <- lag_1_miss(data, n1, n2, prob = 0.2)
+                        data <- delete_complete(data)
+                        
+                        # data <- current_lag_miss(data, n1, n2, prob = 0.2)
+                        # data <- delete_sumY(data)
+                        
+                        # data <- delete_all_0_1(data)
+                        mod <- em_alg_var(data, p = 1, k = 2, 
+                                          max_iter = 100, 
+                                          tol = 1e-6)}, 
+                      mc.cores = 10)
+  
+  # get the result lists
+  # alpha_results <- lapply(results, `[[`, 1)
+  beta_results <- lapply(results, `[[`, 2)
+  beta_se <- lapply(results, `[[`, 4)
+  eta_results <- lapply(results, `[[`, 3)
+  
+  mean_of_list <- function(lst) {
+    Reduce(`+`, lst) / length(lst)
+  }
+  
+  sd_of_list <- function(lst) {
+    mat <- do.call(rbind, lst)
+    apply(mat, 2, sd)
+  }
+  
+  # alpha_mean <- mean_of_list(alpha_results)
+  beta_mean <- mean_of_list(beta_results)
+  beta_sd <- sd_of_list(beta_results)
+  beta_se_mean <- mean_of_list(beta_se)
+  beta_se_sd <- sd_of_list(beta_se)
+  eta_mean <- mean_of_list(eta_results)
+  eta_sd <- sd_of_list(eta_results)
+  
+  # cat("alpha: ", alpha_mean, "\n")
+  cat("beta: ", beta_mean, "(sd: ", beta_sd, ")\n")
+  cat("beta se: ", beta_se_mean, "(sd: ", beta_se_sd, ")\n")
+  cat("eta: ", eta_mean, "(sd: ", eta_sd, ")\n")
+  return(results)
+}
+
+alpha <- c(0, 0, 0, 0)
+# n1 = 4, n2 = 400
+si_2_4_400 <- rep_exp(rep_times, n1 = 4, n2 = 400, alpha, beta, eta)
+
+# n1 = 4, n2 = 800
+si_2_4_800 <- rep_exp(rep_times, n1 = 4, n2 = 800, alpha, beta, eta)
+
+# n1 = 4, n2 = 1600
+si_2_4_1600 <- rep_exp(rep_times, n1 = 4, n2 = 1600, alpha, beta, eta)
+
+alpha <- c(0, 0, 0, 0, 0, 0)
+# n1 = 6, n2 = 400
+si_2_6_400 <- rep_exp(rep_times, n1 = 6, n2 = 400, alpha, beta, eta)
+
+# n1 = 6, n2 = 800
+si_2_6_800 <- rep_exp(rep_times, n1 = 6, n2 = 800, alpha, beta, eta)
+
+# n1 = 6, n2 = 1600
+si_2_6_1600 <- rep_exp(rep_times, n1 = 6, n2 = 1600, alpha, beta, eta)
+
+
+alpha <- c(0, 0, 0, 0, 0, 0, 0, 0)
+# n1 = 8, n2 = 400
+si_2_8_400 <- rep_exp(rep_times, n1 = 8, n2 = 400, alpha, beta, eta)
+
+# n1 = 8, n2 = 800
+si_2_8_800 <- rep_exp(rep_times, n1 = 8, n2 = 800, alpha, beta, eta)
+
+# n1 = 8, n2 = 1600
+si_2_8_1600 <- rep_exp(rep_times, n1 = 8, n2 = 1600, alpha, beta, eta)
+
+# n1 = 8, n2 = 3000
+si_2_8_3000 <- rep_exp(rep_times, n1 = 8, n2 = 3000, alpha, beta, eta)
+```
+
+## Code for Traditional EM Model
+
+```{r}
+# initialize parameters
+initialize_para_var <- function(n1, p, k) {
+  alpha <- rep(0, n1 - 1)
+  beta <- matrix(rnorm(2), nrow = 1, ncol = 2)
+  eta <- matrix(c(0, runif(1)), nrow = 1, ncol = k)
+  
+  para <- list(alpha, beta, eta)
+  return(para)
+}
+
+# E-step
+e_step_var <- function(data, ids, para, k, n1, n2) {
+  
+  # assign the parameters
+  alpha <- matrix(rep(para[[1]], times = k), ncol = k)
+  beta <- para[[2]]
+  beta <- rbind(alpha, beta)
+  eta <- para[[3]]
+  
+  posterior_probs <- matrix(NA, nrow = n2, ncol = k)
+  
+  for (i in 1:n2) {
+    id <- ids[i]
+    data_i <- data[data$id == id, ]
+    x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+    y_i <- as.array(data_i[, "y"])
+    v_i <- as.array(data_i[1, "v"])
+    
+    for (j in 1:k) {
+      x_beta <- x_i %*% beta[, j]
+      posterior_probs[i, j] <- (exp(t(y_i) %*% x_beta) / prod(1 + exp(x_beta))) * 
+        (exp(eta[j] %*% v_i) / (1 + exp(eta[j] %*% v_i)))
+    }
+  }
+  posterior_probs <- posterior_probs / rowSums(posterior_probs)
+  return(posterior_probs)
+}
+
+# M-step
+m_step_var <- function(data, para, posterior_probs, ids, k, n1, n2) {
+  # get current parameters
+  alpha <- para[[1]]
+  beta <- para[[2]]
+  eta <- para[[3]]
+  
+  # update beta
+  for (j in 1:k) {
+    for (iter in 1:1){
+      beta_alpha <- c(alpha, beta[, j])
+      result_grad <- array(NA, dim = n2)
+      result_hess <- array(NA, dim = n2)
+      
+      for (i in 1:n2) {
+        id <- ids[i]
+        data_i <- data[data$id == id, ]
+        x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+        x_i_pure <- as.array(data_i[, "x"])
+        y_i <- as.array(data_i[, "y"])
+        
+        x_beta <- x_i %*% beta_alpha
+        e_i <- exp(x_beta) / (1 + exp(x_beta))
+        V_i <- diag(e_i)- e_i %*% t(e_i)
+        
+        result_grad[i] <- posterior_probs[i, j] * t(x_i_pure) %*% 
+          (as.vector(y_i) - as.vector(e_i))
+        result_hess[i] <- - posterior_probs[i, j] * (t(x_i_pure) %*% V_i %*% x_i_pure)
+      }
+      grad <- sum(result_grad)
+      hess <- sum(result_hess)
+      
+      beta[, j] <- beta[, j] - grad / hess
+    }
+  }
+  
+  # update eta
+  result_grad <- array(NA, dim = n2)
+  result_hess <- array(NA, dim = n2)
+  for (i in 1:n2) {
+    id <- ids[i]
+    data_i <- data[data$id == id, ]
+    v_i <- as.array(data_i[1, "v"])
+    result_grad[i] <- v_i * (posterior_probs[i, 2] - exp(v_i * eta[2]) / 
+                               (1 + exp(v_i * eta[2])))
+    result_hess[i] <- - v_i %*% t(v_i) * exp(v_i %*% eta[2]) / 
+      (1 + exp(v_i %*% eta[2]))^2
+  }
+  eta[2] <- eta[2] - sum(result_grad) / sum(result_hess)
+  
+  para <- list(alpha, beta, eta)
+  return(para)
+}
+
+m_step_var_last <- function(data, para, posterior_probs, ids, k, n1, n2) {
+  # get current parameters
+  alpha <- para[[1]]
+  beta <- para[[2]]
+  eta <- para[[3]]
+  
+  # standard error
+  # just to get a matrix with the same size
+  beta_sd <- beta * 0
+  
+  # update beta
+  for (j in 1:k) {
+    beta_alpha <- c(alpha, beta[, j])
+    result_grad <- array(NA, dim = n2)
+    result_hess <- array(NA, dim = n2)
+    result_1 <- array(NA, dim = n2)
+    
+    for (i in 1:n2) {
+      id <- ids[i]
+      data_i <- data[data$id == id, ]
+      x_i <- as.matrix(data_i[, c(paste0("d", 2:n1), "x")])
+      x_i_pure <- as.array(data_i[, "x"])
+      y_i <- as.array(data_i[, "y"])
+
+      x_beta <- x_i %*% beta_alpha
+      e_i <- exp(x_beta) / (1 + exp(x_beta))
+      V_i <- diag(e_i) - e_i %*% t(e_i)
+      
+      result_grad[i] <- posterior_probs[i, j] * t(x_i_pure) %*% 
+        (as.vector(y_i) - as.vector(e_i))
+      result_hess[i] <- - posterior_probs[i, j] * (t(x_i_pure) %*% V_i %*% x_i_pure)
+      result_1[i] <- t(t(x_i_pure) %*% (as.vector(y_i) - as.vector(e_i))) %*% result_grad[i]
+    }
+    grad <- sum(result_grad)
+    hess <- sum(result_hess)
+    
+    beta[, j] <- beta[, j] - grad / hess
+    
+    matrix_1 <- result_grad %*% t(result_grad)
+    diag_mask <- diag(nrow(matrix_1))
+    off_diag_sum <- sum(matrix_1[!diag_mask])
+    
+    # fisher <- - hess - sum(result_1) - off_diag_sum + grad^2
+    fisher <- - hess - sum(result_1) - off_diag_sum
+    beta_sd[, j] <- sqrt(1 / fisher)
+  }
+  
+  para <- list(alpha, beta, eta, beta_sd)
+  return(para)
+}
+
+# EM Alg
+suppressPackageStartupMessages(library(dplyr))
+em_alg_var <- function(data, p, k, max_iter, tol) {
+  # sum of the response of each subject
+  sumYs <- data %>% 
+    group_by(id) %>% 
+    summarise(total = sum(y), 
+              count = n()) %>% 
+    ungroup()
+  sumYs <- as.data.frame(sumYs)
+  n1 <- max(sumYs$count)
+  n2 <- nrow(sumYs)
+  ids <- sumYs$id
+  
+  para <- initialize_para_var(n1, p, k)
+  
+  for (i in 1:max_iter) {
+    posterior_probs <- e_step_var(data, ids, para, k, n1, n2)
+    new_para <- m_step_var(data, para, posterior_probs, ids, k, n1, n2)
+    
+    if (i > 4) {
+      if (sqrt(sum((new_para[[2]] - para[[2]])^2)) < tol) {
+        cat("Converged in", i, "iterations.\n")
+        break
+      }
+    }
+    para <- new_para
+  }
+  
+  # check error rate find min error rate and permute according to it
+  posterior_probs <- e_step_var(data, ids, para, k, n1, n2)
+  para <- m_step_var_last(data, para, posterior_probs, ids, k, n1, n2)
+  
+  max_col_indices <- apply(posterior_probs, 1, which.max)
+  class <- data %>% group_by(id) %>% summarise(latent_class = latent_class[1]) %>% ungroup()
+  para <- permutation_error(para, k, class, max_col_indices)
+  
+  names(para) <- c("alpha", "beta", "eta", "beta_se")
+  return(para)
+}
+
+permutation_error <- function(para, k, classes, predict_classes) {
+  beta <- para[[2]]
+  if (beta[1] < 0 && beta[2] >= 0) {
+    order <- c(1, 2)
+  } else if (beta[2] < 0 && beta[1] >= 0) {
+    order <- c(2, 1)
+  } else if (beta[1] < 0 && beta[2] < 0) {
+    if (beta[1] < beta[2]) {
+      order <- c(1, 2)
+    } else {
+      order <- c(2, 1)
+    }
+  } else {
+    if (beta[1] < beta[2])
+      order <- c(1, 2)
+    else
+      order <- c(2, 1)
+  }
+  
+  para[[2]] <- para[[2]][, order]
+  para[[3]] <- para[[3]][, order]
+  para[[4]] <- para[[4]][, order]
+  
+  return(para)
+}
+```
+
+One trail
+
+```{r}
+# one try
+alpha <- c(0, 0, 0, 0)
+beta <- c(-1, 1)
+eta <- c(0, 1)
+n1 <- 4
+n2 <- 400
+# probability of missing
+# prob <- 0.2
+
+data <- generate_data(n1, n2, alpha, beta, k = 2, eta)
+# data <- delete_all_0_1(data)
+
+mod <- em_alg_var(data, p = 1, k = 2, max_iter = 100, tol = 1e-6)
+mod
+```
+
+Repeated experiments
+
+```{r}
+# repeated experiments
+library(parallel)
+rep_times <- 20
+beta <- c(-1, 1)
+eta <- c(0, 1)
+
+rep_exp <- function(rep_times, n1, n2, alpha, beta, eta) {
+  results <- mclapply(1:rep_times, 
+                      function(i) {
+                        data <- generate_data(n1, n2, alpha, beta, k = 2, eta)
+                        mod <- em_alg_var(data, p = 1, k = 2, 
+                                          max_iter = 200, 
+                                          tol = 1e-6)}, 
+                      mc.cores = 10)
+  
+  # get the result lists
+  # alpha_results <- lapply(results, `[[`, 1)
+  beta_results <- lapply(results, `[[`, 2)
+  beta_se <- lapply(results, `[[`, 4)
+  eta_results <- lapply(results, `[[`, 3)
+  
+  mean_of_list <- function(lst) {
+    Reduce(`+`, lst) / length(lst)
+  }
+  
+  sd_of_list <- function(lst) {
+    mat <- do.call(rbind, lst)
+    apply(mat, 2, sd)
+  }
+  
+  # alpha_mean <- mean_of_list(alpha_results)
+  beta_mean <- mean_of_list(beta_results)
+  beta_sd <- sd_of_list(beta_results)
+  beta_se_mean <- mean_of_list(beta_se)
+  beta_se_sd <- sd_of_list(beta_se)
+  eta_mean <- mean_of_list(eta_results)
+  eta_sd <- sd_of_list(eta_results)
+  
+  # cat("alpha: ", alpha_mean, "\n")
+  cat("beta: ", beta_mean, "(sd: ", beta_sd, ")\n")
+  cat("beta se: ", beta_se_mean, "(sd: ", beta_se_sd, ")\n")
+  cat("eta: ", eta_mean, "(sd: ", eta_sd, ")\n")
+  return(results)
+}
+
+alpha <- c(0, 0, 0, 0)
+# n1 = 4, n2 = 400
+si_2_4_400 <- rep_exp(rep_times, n1 = 4, n2 = 400, alpha, beta, eta)
+
+# n1 = 4, n2 = 800
+si_2_4_800 <- rep_exp(rep_times, n1 = 4, n2 = 800, alpha, beta, eta)
+
+# n1 = 4, n2 = 1600
+si_2_4_1600 <- rep_exp(rep_times, n1 = 4, n2 = 1600, alpha, beta, eta)
+
+alpha <- c(0, 0, 0, 0, 0, 0)
+# n1 = 6, n2 = 400
+si_2_6_400 <- rep_exp(rep_times, n1 = 6, n2 = 400, alpha, beta, eta)
+
+# n1 = 6, n2 = 800
+si_2_6_800 <- rep_exp(rep_times, n1 = 6, n2 = 800, alpha, beta, eta)
+
+# n1 = 6, n2 = 1600
+si_2_6_1600 <- rep_exp(rep_times, n1 = 6, n2 = 1600, alpha, beta, eta)
+
+
+alpha <- c(0, 0, 0, 0, 0, 0, 0, 0)
+# n1 = 8, n2 = 400
+si_2_8_400 <- rep_exp(rep_times, n1 = 8, n2 = 400, alpha, beta, eta)
+
+# n1 = 8, n2 = 800
+si_2_8_800 <- rep_exp(rep_times, n1 = 8, n2 = 800, alpha, beta, eta)
+
+# n1 = 8, n2 = 1600
+si_2_8_1600 <- rep_exp(rep_times, n1 = 8, n2 = 1600, alpha, beta, eta)
+```
+
+## Simulation Data Generation
+
+```{r}
+# data generation
+logit <- function(x) {
+  return(log(x / (1 - x)))
+}
+
+invLogit <- function(x) {
+  return(1 / (1 + exp(- x)))
+}
+
+generate_data <- function(n1, n2, alpha, beta, k, eta) {
+  # latent class variable
+  v <- runif(n2, min = -0.5, max = 0.5)
+  # v <- sample(c(1, 2), n2, replace = TRUE)
+  probs <- exp(v * eta[1]) / (exp(v * eta[1]) + exp(v * eta[2]))
+  
+  c <- rbinom(n2, size = 1, prob = 1 - probs) + 1
+  # c <- ifelse(probs > 0.5, 1, 2)
+  
+  id <- rep(1:n2, each = n1)
+  t <- rep(1:n1, times = n2)
+  dummy_vars <- model.matrix(~ factor(t) - 1, data = data.frame(t))
+  V <- rep(v, each = n1)
+  latent_class <- rep(c, each = n1)
+  
+  # variable
+  X <- runif(n1 * n2, min = 0, max = 1)
+  
+  # linear equation
+  linear <- array(NA, dim = n1 * n2)
+  for (i in 1:n2) {
+    for (j in 1:n1) {
+      linear[(i - 1) * n1 + j] <- alpha[j] + X[(i - 1) * n1 + j] * beta[c[i]]
+    }
+  }
+  
+  prob <- invLogit(linear)
+  
+  sample_row <- function(probs) {
+    sample(c(0, 1), size = 1, prob = probs)
+  }
+  
+  y <- apply(cbind(1 - prob, prob), 1, sample_row)
+  data <- cbind(id, t, dummy_vars, X, V, latent_class, y)
+  data <- as.data.frame(data)
+  colnames(data) <- c("id", "t", paste0("d", 1:n1), "x", "v", "latent_class", "y")
+  return(data)
+}
+
+covariate_miss <- function(data, n1, n2, prob) {
+  missing <- array(TRUE, dim = n1 * n2)
+  for (i in 1:n2) {
+    for (t in 1:n1) {
+      if (data[(i - 1) * n1 + t, "x"] > 0.5) {
+        m <- rbinom(n = 1, size = 1, prob = prob)
+        if (m == 1) {
+          missing[(i - 1) * n1 + t] <- FALSE
+        }
+      }
+    }
+  }
+  data <- data[missing, ]
+  return(data)
+}
+```
+
+## Different Kinds of Missingness
+
+```{r}
+current_response_miss <- function(data, n1, n2, prob) {
+  missing <- array(TRUE, dim = n1 * n2)
+  for (i in 1:n2) {
+    for (t in 1:n1) {
+      if (data[(i - 1) * n1 + t, "y"] == 0) {
+        m <- rbinom(n = 1, size = 1, prob = prob)
+        if (m == 1) {
+          missing[(i - 1) * n1 + t] <- FALSE
+        }
+      }
+    }
+  }
+  data <- data[missing, ]
+  return(data)
+}
+
+lag_1_miss <- function(data, n1, n2, prob) {
+  missing <- array(TRUE, dim = n1 * n2)
+  for (i in 1:n2) {
+    for (t in 1:(n1 - 1)) {
+      if (data[(i - 1) * n1 + t, "y"] == 0) {
+        m <- rbinom(n = 1, size = 1, prob = prob)
+        if (m == 1) {
+          missing[(i - 1) * n1 + t + 1] <- FALSE
+        }
+      }
+    }
+  }
+  data <- data[missing, ]
+  return(data)
+}
+
+current_lag_miss <- function(data, n1, n2, prob) {
+  missing <- array(TRUE, dim = n1 * n2)
+  for (i in 1:n2) {
+    for (t in 1:n1) {
+      if (data[(i - 1) * n1 + t, "y"] == 0) {
+        m <- rbinom(n = 1, size = 1, prob = prob)
+        if (m == 1) {
+          missing[((i - 1) * n1 + t):(i * n1)] <- rep(FALSE, times = n1 - t + 1)
+          break
+        }
+      }
+    }
+  }
+  data <- data[missing, ]
+  return(data)
+}
+
+# delete the subjects with all 0 or all 1 responses
+delete_all_0_1 <- function(data) {
+  sumY <- data %>% 
+    group_by(id) %>% 
+    summarise(count = n(), 
+              total = sum(y)) %>% 
+    ungroup()
+  sumY <- as.data.frame(sumY)
+  ids <- sumY[sumY$total == 0 | sumY$total == sumY$count, 1]
+  data <- data[!data$id %in% ids, ]
+  return(data)
+}
+
+# lag 1: complete data analysis + delete the subjects with all 0 or all 1 responses
+delete_complete <- function(data) {
+  sumY <- data %>% 
+    group_by(id) %>% 
+    summarise(count = n(), 
+              total = sum(y)) %>% 
+    ungroup()
+  sumY <- as.data.frame(sumY)
+  n1 <- max(sumY$count)
+  
+  ids <- sumY[sumY$count != n1 | sumY$total == 0 | sumY$total == sumY$count, 1]
+  data <- data[!data$id %in% ids, ]
+}
+
+
+# current and lag: only sumY = 1 or N1 - 1 data analysis
+delete_sumY <- function(data) {
+  sumY <- data %>% 
+    group_by(id) %>% 
+    summarise(count = n(), 
+              total = sum(y)) %>% 
+    ungroup()
+  sumY <- as.data.frame(sumY)
+  n1 <- max(sumY$count)
+  
+  ids <- sumY[sumY$total == 1 | sumY$total == (n1 - 1), 1]
+  data <- data[data$id %in% ids, ]
+  return(data)
+}
+```
+
+Summary Statistics of the simulated data
+
+```{r}
+# summary of the data
+suppressPackageStartupMessages(library(dplyr))
+# number of subject in each group
+summary1 <- data %>% group_by(latent_class) %>% summarise(count = n() / n1)
+summary1
+# sum of Y
+summary2 <- data %>% group_by(id) %>% summarise(sum_y = sum(y),
+                                                latent_class = latent_class[1])
+table(summary2$sum_y)
+# sum of Y in each group
+summary3 <- summary2 %>% group_by(latent_class, sum_y) %>% summarise(count = n())
+as.data.frame(summary3)
+```
